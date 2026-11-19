@@ -417,6 +417,7 @@ def parallel_type(value):
 
 
 _worker_id = 0
+_worker_subsuites = None
 
 
 def _claim_database_clone_slot(worker_slots, timeout=5):
@@ -455,7 +456,7 @@ def _claim_database_clone_slot(worker_slots, timeout=5):
         time.sleep(0.05)
 
 
-def _release_dead_worker_slots(worker_slots):
+def _release_dead_worker_slots(worker_slots, worker_subsuites=None):
     """
     Release database clone slots owned by worker processes that exited, so
     that replacement workers spawned by multiprocessing.Pool can reuse them.
@@ -463,11 +464,22 @@ def _release_dead_worker_slots(worker_slots):
     This runs in the parent process, where pool workers are visible as active
     children.
     """
+    dead_workers = {}
     with worker_slots.get_lock():
         alive_pids = {child.pid for child in multiprocessing.active_children()}
         for index, owner in enumerate(worker_slots):
             if owner and owner not in alive_pids:
+                if worker_subsuites is not None:
+                    subsuite_index = worker_subsuites[index]
+                    if subsuite_index > 0:
+                        dead_workers[owner] = subsuite_index - 1
+                        worker_subsuites[index] = 0
+                    else:
+                        dead_workers[owner] = None
+                else:
+                    dead_workers[owner] = None
                 worker_slots[index] = 0
+    return dead_workers
 
 
 def _init_worker(
@@ -524,9 +536,14 @@ def _init_worker(
         )
 
 
-def _safe_init_worker(init_worker, init_failed, *args, **kwargs):
+def _safe_init_worker(init_worker, init_failed, worker_subsuites, *args, **kwargs):
+    global _worker_subsuites
+
+    _worker_subsuites = worker_subsuites
     try:
         init_worker(*args, **kwargs)
+        if _worker_id:
+            worker_subsuites[_worker_id - 1] = -1
     except Exception:
         init_failed.value = True
         raise
@@ -540,9 +557,13 @@ def _run_subsuite(args):
     because of the multiprocessing module's requirements.
     """
     runner_class, subsuite_index, subsuite, failfast, buffer = args
-    runner = runner_class(failfast=failfast, buffer=buffer)
-    result = runner.run(subsuite)
-    return subsuite_index, result.events
+    _worker_subsuites[_worker_id - 1] = subsuite_index + 1
+    try:
+        runner = runner_class(failfast=failfast, buffer=buffer)
+        result = runner.run(subsuite)
+        return subsuite_index, result.events
+    finally:
+        _worker_subsuites[_worker_id - 1] = -1
 
 
 def _process_setup_stub(*args):
@@ -604,6 +625,9 @@ class ParallelTestSuite(unittest.TestSuite):
         self.initialize_suite()
         # One slot per db clone, holding the pid of the worker process (or 0).
         worker_slots = multiprocessing.Array(ctypes.c_longlong, self.processes)
+        # One slot per worker, holding its current subsuite index plus one
+        # (or 0).
+        worker_subsuites = multiprocessing.Array(ctypes.c_longlong, self.processes)
         init_failed = multiprocessing.Value(ctypes.c_bool, False)
         args = [
             (self.runner_class, index, subsuite, self.failfast, self.buffer)
@@ -617,6 +641,7 @@ class ParallelTestSuite(unittest.TestSuite):
             initializer=functools.partial(_safe_init_worker, self.init_worker.__func__),
             initargs=[
                 init_failed,
+                worker_subsuites,
                 worker_slots,
                 self.initial_settings,
                 self.serialized_contents,
@@ -626,28 +651,97 @@ class ParallelTestSuite(unittest.TestSuite):
                 self.used_aliases,
             ],
         ) as pool:
+            workers = set(pool._pool)
             test_results = pool.imap_unordered(self.run_subsuite.__func__, args)
+            completed_subsuites = set()
+            suspected_interrupted_subsuites = set()
+            attributed_dead_workers = set()
+            unattributed_dead_workers = set()
+            unattributed_idle_timeouts = 0
+            worker_interrupted = False
 
             while True:
                 if result.shouldStop:
                     pool.terminate()
                     break
 
-                # Return the database clones of exited workers to the pool of
-                # available slots so that replacement workers can reuse them.
-                _release_dead_worker_slots(worker_slots)
+                workers.update(pool._pool)
+                for worker_pid, subsuite_index in _release_dead_worker_slots(
+                    worker_slots, worker_subsuites
+                ).items():
+                    if subsuite_index is None:
+                        unattributed_dead_workers.add(worker_pid)
+                    else:
+                        attributed_dead_workers.add(worker_pid)
+                        suspected_interrupted_subsuites.add(subsuite_index)
+
+                if len(completed_subsuites) == len(args):
+                    if worker_interrupted:
+                        pool.terminate()
+                    else:
+                        pool.close()
+                    break
 
                 try:
                     subsuite_index, events = test_results.next(timeout=0.1)
                 except multiprocessing.TimeoutError as err:
+                    for worker_pid, subsuite_index in _release_dead_worker_slots(
+                        worker_slots, worker_subsuites
+                    ).items():
+                        if subsuite_index is None:
+                            unattributed_dead_workers.add(worker_pid)
+                        else:
+                            attributed_dead_workers.add(worker_pid)
+                            suspected_interrupted_subsuites.add(subsuite_index)
                     if init_failed.value:
                         err.add_note("ERROR: _init_worker failed, see prior traceback")
                         raise
+                    for subsuite_index in suspected_interrupted_subsuites:
+                        error = RuntimeError(
+                            "--parallel was unable to run all tests due to dead "
+                            "workers."
+                        )
+                        test = unittest.suite._ErrorHolder("parallel test worker")
+                        result.addError(test, (RuntimeError, error, None))
+                        completed_subsuites.add(subsuite_index)
+                        worker_interrupted = True
+                    suspected_interrupted_subsuites.clear()
+                    unknown_dead_workers = {
+                        worker.pid
+                        for worker in workers
+                        if worker.exitcode is not None
+                        and worker.pid not in attributed_dead_workers
+                    }
+                    unknown_dead_workers.update(unattributed_dead_workers)
+                    if unknown_dead_workers:
+                        with worker_subsuites.get_lock():
+                            all_workers_idle = all(
+                                current_subsuite == -1
+                                for current_subsuite in worker_subsuites
+                            )
+                        if all_workers_idle:
+                            unattributed_idle_timeouts += 1
+                        else:
+                            unattributed_idle_timeouts = 0
+                        if unattributed_idle_timeouts >= 2:
+                            error = RuntimeError(
+                                "--parallel was unable to run all tests due to dead "
+                                "workers."
+                            )
+                            test = unittest.suite._ErrorHolder("parallel test worker")
+                            result.addError(test, (RuntimeError, error, None))
+                            pool.terminate()
+                            break
                     continue
                 except StopIteration:
                     pool.close()
                     break
 
+                suspected_interrupted_subsuites.discard(subsuite_index)
+                if subsuite_index in completed_subsuites:
+                    continue
+                completed_subsuites.add(subsuite_index)
+                unattributed_idle_timeouts = 0
                 tests = list(self.subsuites[subsuite_index])
                 for event in events:
                     self.handle_event(result, tests, event)

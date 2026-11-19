@@ -2,7 +2,9 @@ import ctypes
 import multiprocessing
 import os
 import pickle
+import subprocess
 import sys
+import time
 import unittest
 from unittest import mock
 from unittest.case import TestCase
@@ -13,6 +15,7 @@ from django.test import SimpleTestCase
 from django.test.runner import (
     ParallelTestSuite,
     RemoteTestResult,
+    RemoteTestRunner,
     _claim_database_clone_slot,
     _release_dead_worker_slots,
 )
@@ -30,6 +33,79 @@ def _test_error_exc_info():
         raise ValueError("woops")
     except ValueError:
         return sys.exc_info()
+
+
+def _exit_during_unpickle():
+    os._exit(17)
+
+
+class ExitDuringUnpickleTestCase(TestCase):
+    def __reduce__(self):
+        return (_exit_during_unpickle, ())
+
+
+class ExitInRunnerTestCase(TestCase):
+    def worker_exit(self):
+        pass
+
+
+class PassingTestCase(TestCase):
+    def pass_test(self):
+        pass
+
+
+class ExitInRunnerRemoteTestRunner(RemoteTestRunner):
+    def run(self, test):
+        if any(isinstance(test_case, ExitInRunnerTestCase) for test_case in test):
+            os._exit(17)
+        return super().run(test)
+
+
+class SlowHandleParallelTestSuite(ParallelTestSuite):
+    def handle_event(self, result, tests, event):
+        if not hasattr(self, "event_handled"):
+            self.event_handled = True
+            time.sleep(1)
+        return super().handle_event(result, tests, event)
+
+
+def _run_parallel_suite_with_worker_exit(connection, scenario):
+    suite_class = ParallelTestSuite
+    processes = 1
+    if scenario == "during_unpickle":
+        interrupted_test = ExitDuringUnpickleTestCase()
+        runner_class = RemoteTestRunner
+        subsuites = [
+            TestSuite([interrupted_test]),
+            TestSuite([PassingTestCase("pass_test")]),
+        ]
+    elif scenario == "during_subsuite":
+        interrupted_test = ExitInRunnerTestCase("worker_exit")
+        runner_class = ExitInRunnerRemoteTestRunner
+        subsuites = [
+            TestSuite([interrupted_test]),
+            TestSuite([PassingTestCase("pass_test")]),
+        ]
+    elif scenario == "during_unpickle_after_result":
+        runner_class = RemoteTestRunner
+        suite_class = SlowHandleParallelTestSuite
+        subsuites = [
+            TestSuite([PassingTestCase("pass_test")]),
+            TestSuite([PassingTestCase("pass_test")]),
+            TestSuite([ExitDuringUnpickleTestCase()]),
+        ]
+    suite = suite_class(subsuites, processes=processes)
+    suite.runner_class = runner_class
+    suite.serialized_aliases = set()
+    result = TestResult()
+    try:
+        suite.run(result)
+    except BaseException as exc:
+        connection.send(("exception", repr(exc)))
+    else:
+        connection.send(("result", result.testsRun, len(result.errors)))
+    finally:
+        connection.close()
 
 
 class ExceptionThatFailsUnpickling(Exception):
@@ -277,6 +353,18 @@ class DatabaseCloneSlotTests(SimpleTestCase):
             _release_dead_worker_slots(slots)
         self.assertEqual(list(slots), [0, 0, 103])
 
+    def test_release_dead_worker_slots_returns_interrupted_subsuites(self):
+        alive_worker = mock.Mock(pid=102)
+        slots = self.make_slots(101, 102)
+        worker_subsuites = self.make_slots(1, 0)
+        with mock.patch.object(
+            multiprocessing, "active_children", return_value=[alive_worker]
+        ):
+            dead_workers = _release_dead_worker_slots(slots, worker_subsuites)
+        self.assertEqual(dead_workers, {101: 0})
+        self.assertEqual(list(slots), [0, 102])
+        self.assertEqual(list(worker_subsuites), [0, 0])
+
     def test_released_slot_is_claimed_by_replacement_worker(self):
         dead_worker_pid = 101
         slots = self.make_slots(dead_worker_pid, 102)
@@ -289,6 +377,73 @@ class DatabaseCloneSlotTests(SimpleTestCase):
 
 
 class ParallelTestSuiteTest(SimpleTestCase):
+    def assert_worker_exit_result(self, scenario):
+        if multiprocessing.current_process().daemon:
+            tests_dir = os.path.dirname(os.path.dirname(__file__))
+            test_label = (
+                f"test_runner.test_parallel.{self.__class__.__name__}."
+                f"{self._testMethodName}"
+            )
+            completed_process = subprocess.run(
+                [sys.executable, "runtests.py", test_label, "--parallel", "1"],
+                capture_output=True,
+                cwd=tests_dir,
+                env=os.environ.copy(),
+                text=True,
+                timeout=20,
+            )
+            self.assertEqual(
+                completed_process.returncode,
+                0,
+                completed_process.stdout + completed_process.stderr,
+            )
+            return None
+        context = multiprocessing.get_context("fork")
+        parent_connection, child_connection = context.Pipe(duplex=False)
+        process = context.Process(
+            target=_run_parallel_suite_with_worker_exit,
+            args=(child_connection, scenario),
+        )
+        process.start()
+        child_connection.close()
+        process.join(timeout=10)
+        if process.is_alive():
+            process.terminate()
+            process.join()
+            self.fail("ParallelTestSuite.run() waited indefinitely for a dead worker.")
+        self.assertEqual(process.exitcode, 0)
+        self.assertTrue(parent_connection.poll())
+        outcome = parent_connection.recv()
+        parent_connection.close()
+        self.assertEqual(outcome[0], "result")
+        self.assertEqual(outcome[2], 1)
+        return outcome
+
+    @unittest.skipUnless(
+        "fork" in multiprocessing.get_all_start_methods(),
+        "requires the fork start method",
+    )
+    def test_worker_exit_during_subsuite_fails_run_and_continues(self):
+        outcome = self.assert_worker_exit_result("during_subsuite")
+        if outcome is not None:
+            self.assertEqual(outcome[1], 1)
+
+    @unittest.skipUnless(
+        "fork" in multiprocessing.get_all_start_methods(),
+        "requires the fork start method",
+    )
+    def test_worker_exit_during_unpickle_fails_run(self):
+        self.assert_worker_exit_result("during_unpickle")
+
+    @unittest.skipUnless(
+        "fork" in multiprocessing.get_all_start_methods(),
+        "requires the fork start method",
+    )
+    def test_worker_exit_during_unpickle_after_result_fails_run(self):
+        outcome = self.assert_worker_exit_result("during_unpickle_after_result")
+        if outcome is not None:
+            self.assertEqual(outcome[1:], (2, 1))
+
     @unittest.skipUnless(tblib is not None, "requires tblib to be installed")
     def test_handle_add_error_before_first_test(self):
         dummy_subsuites = []
@@ -376,3 +531,120 @@ class ParallelTestSuiteTest(SimpleTestCase):
             pts.run(test_result)
 
         self.assertIn("ValueError: woops", test_result.errors[0][1])
+
+    def test_interrupted_worker_fails_run_and_continues(self):
+        suite = ParallelTestSuite(
+            [TestSuite([TestCase()]), TestSuite([TestCase()])], processes=1
+        )
+        suite.serialized_aliases = set()
+        result = TestResult()
+
+        class TestResults:
+            def __init__(self):
+                self.items = [(1, [])]
+                self.worker_slots_released = False
+
+            def next(self, timeout=None):
+                self.assert_worker_slots_released()
+                if self.items:
+                    return self.items.pop(0)
+                raise multiprocessing.TimeoutError
+
+            def assert_worker_slots_released(self):
+                if not self.worker_slots_released:
+                    raise AssertionError(
+                        "Dead worker slots weren't released before reading results."
+                    )
+
+        test_results = TestResults()
+        dead_worker_reported = False
+
+        def release_dead_worker_slots(*args):
+            nonlocal dead_worker_reported
+            test_results.worker_slots_released = True
+            if not dead_worker_reported:
+                dead_worker_reported = True
+                return {101: 0}
+            return {}
+
+        with (
+            mock.patch("multiprocessing.Pool") as mock_pool,
+            mock.patch(
+                "django.test.runner._release_dead_worker_slots",
+                side_effect=release_dead_worker_slots,
+            ),
+        ):
+            pool = mock_pool.return_value.__enter__.return_value
+            pool.imap_unordered.return_value = test_results
+            suite.run(result)
+
+        msg = "--parallel was unable to run all tests due to dead workers."
+        self.assertIn(msg, result.errors[0][1])
+        pool.close.assert_not_called()
+        pool.terminate.assert_called_once()
+
+    def test_unattributed_worker_exit_fails_run(self):
+        suite = ParallelTestSuite([TestSuite([TestCase()])], processes=1)
+        suite.serialized_aliases = set()
+        result = TestResult()
+
+        def release_dead_worker_slots(worker_slots, worker_subsuites):
+            worker_subsuites[0] = -1
+            return {}
+
+        with (
+            mock.patch("multiprocessing.Pool") as mock_pool,
+            mock.patch(
+                "django.test.runner._release_dead_worker_slots",
+                side_effect=release_dead_worker_slots,
+            ),
+        ):
+            pool = mock_pool.return_value.__enter__.return_value
+            pool._pool = [mock.Mock(pid=101, exitcode=17)]
+            pool.imap_unordered.return_value.next.side_effect = [
+                multiprocessing.TimeoutError,
+                multiprocessing.TimeoutError,
+                AssertionError("The runner kept waiting after a worker died."),
+            ]
+            suite.run(result)
+
+        msg = "--parallel was unable to run all tests due to dead workers."
+        self.assertIn(msg, result.errors[0][1])
+        pool.terminate.assert_called_once()
+
+    def test_idle_worker_exit_does_not_interrupt_active_subsuite(self):
+        suite = ParallelTestSuite(
+            [TestSuite([TestCase()]), TestSuite([TestCase()])], processes=1
+        )
+        suite.serialized_aliases = set()
+        result = TestResult()
+        test_results = mock.Mock()
+        test_results.next.side_effect = [
+            (0, []),
+            multiprocessing.TimeoutError,
+            (1, []),
+        ]
+        dead_worker_reported = False
+
+        def release_dead_worker_slots(worker_slots, worker_subsuites):
+            nonlocal dead_worker_reported
+            if not dead_worker_reported:
+                dead_worker_reported = True
+                worker_subsuites[0] = 2
+                return {101: None}
+            return {}
+
+        with (
+            mock.patch("multiprocessing.Pool") as mock_pool,
+            mock.patch(
+                "django.test.runner._release_dead_worker_slots",
+                side_effect=release_dead_worker_slots,
+            ),
+        ):
+            pool = mock_pool.return_value.__enter__.return_value
+            pool.imap_unordered.return_value = test_results
+            suite.run(result)
+
+        self.assertEqual(result.errors, [])
+        pool.close.assert_called_once()
+        pool.terminate.assert_not_called()
